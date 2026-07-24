@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, BytesN, Env, Map, String};
+use soroban_sdk::{contracterror, contracttype, BytesN, Map, String};
 
 pub const MAX_TEXT_RECORD_KEY_BYTES: u32 = 64;
 pub const MAX_TEXT_RECORD_VALUE_BYTES: u32 = 256;
@@ -24,8 +24,6 @@ pub enum MetadataError {
     MetadataNotFound = 105,
 }
 
-pub const METADATA_UPDATED_EVENT: &str = "MetadataUpdated";
-
 pub fn validate_text_record(key: &String, value: &String) -> Result<(), MetadataError> {
     if key.len() > MAX_TEXT_RECORD_KEY_BYTES {
         return Err(MetadataError::MetadataKeyTooLong);
@@ -35,7 +33,10 @@ pub fn validate_text_record(key: &String, value: &String) -> Result<(), Metadata
         return Err(MetadataError::MetadataValueTooLong);
     }
 
-    let record_len = key.len().checked_add(value.len()).ok_or(MetadataError::MetadataRecordTooLong)?;
+    let record_len = key
+        .len()
+        .checked_add(value.len())
+        .ok_or(MetadataError::MetadataRecordTooLong)?;
     if record_len > MAX_METADATA_TOTAL_BYTES {
         return Err(MetadataError::MetadataRecordTooLong);
     }
@@ -85,12 +86,12 @@ mod test {
 
         let mut text_records = Map::<String, String>::new(&env);
         text_records.set(
-            &String::from_str(&env, "avatar"),
-            &String::from_str(&env, "https://example.com/avatar.png"),
+            String::from_str(&env, "avatar"),
+            String::from_str(&env, "https://example.com/avatar.png"),
         );
         text_records.set(
-            &String::from_str(&env, "twitter"),
-            &String::from_str(&env, "@wraithprotocol"),
+            String::from_str(&env, "twitter"),
+            String::from_str(&env, "@wraithprotocol"),
         );
 
         let metadata = MetadataEntry {
@@ -107,9 +108,15 @@ mod test {
         let key = String::from_str(&env, "a");
         let value = String::from_str(&env, "x");
 
-        let long_key = String::from_str(&env, "012345678901234567890123456789012345678901234567890123456789012345");
+        let long_key = String::from_str(
+            &env,
+            "012345678901234567890123456789012345678901234567890123456789012345",
+        );
         assert_eq!(validate_text_record(&key, &value), Ok(()));
-        assert_eq!(validate_text_record(&long_key, &value), Err(MetadataError::MetadataKeyTooLong));
+        assert_eq!(
+            validate_text_record(&long_key, &value),
+            Err(MetadataError::MetadataKeyTooLong)
+        );
     }
 
     #[test]
@@ -117,15 +124,31 @@ mod test {
         let env = Env::default();
         let mut text_records = Map::<String, String>::new(&env);
 
+        // 5 records each ~206 bytes (key=1, value=205) = 1030 total > 1024 limit
         text_records.set(
-            &String::from_str(&env, "description"),
-            &String::from_str(&env, "012345678901234567890123456789012345678901234567890123456789012345"),
+            String::from_str(&env, "a"),
+            String::from_str(&env, &"v".repeat(205)),
         );
         text_records.set(
-            &String::from_str(&env, "avatar"),
-            &String::from_str(&env, "012345678901234567890123456789012345678901234567890123456789012345"),
+            String::from_str(&env, "b"),
+            String::from_str(&env, &"v".repeat(205)),
+        );
+        text_records.set(
+            String::from_str(&env, "c"),
+            String::from_str(&env, &"v".repeat(205)),
+        );
+        text_records.set(
+            String::from_str(&env, "d"),
+            String::from_str(&env, &"v".repeat(205)),
+        );
+        text_records.set(
+            String::from_str(&env, "e"),
+            String::from_str(&env, &"v".repeat(205)),
         );
 
-        assert_eq!(validate_text_records(&text_records), Err(MetadataError::MetadataTotalTooLong));
+        assert_eq!(
+            validate_text_records(&text_records),
+            Err(MetadataError::MetadataTotalTooLong)
+        );
     }
 }
