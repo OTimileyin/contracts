@@ -114,3 +114,19 @@ See `STORAGE.md` for the persistent-storage layout and rent strategy.
 Auction entries (`AuctionKey::Auction`, `AuctionKey::Bid`) live in
 persistent storage with a ~30-day TTL extension on every write, which
 comfortably covers the configured phase durations.
+
+## Metadata records
+
+Optional on-chain metadata can be attached to a registered name by its owner,
+without touching the `resolve` hot path:
+
+- `text_records` — key/value text mappings such as `avatar`, `twitter`, and
+  `description` (key ≤ 64 bytes, value ≤ 256 bytes).
+- `content_hash` — optional `BytesN<32>` content identifier for IPFS or
+  similar content-addressed payloads.
+
+Total metadata payload is capped at 1024 bytes. Invalid sizes return the
+dedicated typed errors `MetadataKeyTooLong`, `MetadataValueTooLong`,
+`MetadataRecordTooLong`, `MetadataTotalTooLong`, and `MetadataNotFound`.
+Metadata is removed when the name is released. Ownership is enforced by the
+name owner before metadata storage can be updated.
