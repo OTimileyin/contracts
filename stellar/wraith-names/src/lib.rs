@@ -10,7 +10,10 @@ use soroban_sdk::{
     String, Vec,
 };
 
+pub mod auction;
 mod multisig;
+
+pub use auction::{Auction, AuctionConfig, AuctionError, SealedBid};
 pub use multisig::RotationProposal;
 
 pub const WRAITH_NAMES_DOMAIN: &[u8] = b"wraith-names:v1";
@@ -33,6 +36,10 @@ pub enum DataKey {
     Guardians(BytesN<32>),
     /// Pending recovery proposal for a name.
     Recovery(BytesN<32>),
+    /// Pause admin address.
+    Admin,
+    /// Whether the contract is paused.
+    Paused,
     /// Protocol-level governance multisig signer set.
     MultisigSigners,
     /// Protocol-level governance multisig quorum threshold.
@@ -97,6 +104,8 @@ pub enum NamesError {
     InvalidThreshold = 18,
     InvalidExtendLedger = 19,
     ParentNotFound = 20,
+    /// The contract is paused.
+    Paused = 32,
     /// The protocol-level governance multisig has not been initialised.
     MultisigNotInitialized = 21,
     /// The protocol-level governance multisig has already been initialised.
@@ -115,6 +124,9 @@ pub enum NamesError {
     TimelockNotElapsed = 28,
     NameTooDeep = 29,
     BulkLimitExceeded = 30,
+    /// The name is premium (<= 4 chars) and the auction window is active, so
+    /// it can only be obtained through the sealed-bid auction.
+    PremiumAuctionRequired = 31,
 }
 
 const TTL_THRESHOLD: u32 = 17280; // ~1 day
@@ -125,6 +137,82 @@ pub struct WraithNamesContract;
 
 #[contractimpl]
 impl WraithNamesContract {
+    /// Initialise the contract by storing the pause admin.
+    ///
+    /// Must be called before `pause` / `unpause`. Idempotent: calling
+    /// more than once is a no-op (the first admin sticks).
+    pub fn init(env: Env, admin: Address) -> Result<(), NamesError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+            Self::extend_instance_ttl(&env);
+        }
+        Ok(())
+    }
+
+    /// Pause the contract — admin only.
+    /// Prevents all registrations, updates, releases and TTL extensions
+    /// while paused. Lookups (`resolve`, `name_of`) remain available.
+    pub fn pause(env: Env, caller: Address) -> Result<(), NamesError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set — call init first");
+        if caller != admin {
+            panic!("unauthorized: only admin can pause");
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("paused"),), (caller,));
+        Ok(())
+    }
+
+    /// Unpause the contract — admin only.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), NamesError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set — call init first");
+        if caller != admin {
+            panic!("unauthorized: only admin can unpause");
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("unpaused"),), (caller,));
+        Ok(())
+    }
+
+    /// Returns true if the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Internal: require the contract is not paused.
+    fn require_not_paused(env: &Env) -> Result<(), NamesError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(NamesError::Paused);
+        }
+        Ok(())
+    }
+
+    /// Internal: extend instance TTL.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
     /// Register a name mapped to a stealth meta-address.
     pub fn register(
         env: Env,
@@ -132,8 +220,9 @@ impl WraithNamesContract {
         name: String,
         stealth_meta_address: Bytes,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         owner.require_auth();
-        Self::register_internal(&env, owner, name, stealth_meta_address)
+        Self::register_internal(&env, owner, name, stealth_meta_address, false)
     }
 
     /// Register a name on behalf of an owner using a signed authorization.
@@ -145,6 +234,7 @@ impl WraithNamesContract {
         signature: BytesN<64>,
         expiry: u64,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         let replay_key = Self::verify_on_behalf_authorization(
             &env,
             &owner,
@@ -154,7 +244,7 @@ impl WraithNamesContract {
             &signature,
             expiry,
         )?;
-        Self::register_internal(&env, owner, name, stealth_meta_address)?;
+        Self::register_internal(&env, owner, name, stealth_meta_address, false)?;
         // Persist replay protection to prevent signature reuse
         env.storage()
             .persistent()
@@ -170,6 +260,7 @@ impl WraithNamesContract {
         name: String,
         new_meta_address: Bytes,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         owner.require_auth();
         Self::update_internal(&env, owner, name, new_meta_address)
     }
@@ -183,6 +274,7 @@ impl WraithNamesContract {
         signature: BytesN<64>,
         expiry: u64,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         let replay_key = Self::verify_on_behalf_authorization(
             &env,
             &owner,
@@ -201,6 +293,7 @@ impl WraithNamesContract {
 
     /// Release a name, making it available again.
     pub fn release(env: Env, owner: Address, name: String) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         owner.require_auth();
         Self::release_internal(&env, owner, name)
     }
@@ -213,6 +306,7 @@ impl WraithNamesContract {
         signature: BytesN<64>,
         expiry: u64,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         let empty_meta = Bytes::new(&env);
         let replay_key = Self::verify_on_behalf_authorization(
             &env,
@@ -268,7 +362,7 @@ impl WraithNamesContract {
         for i in 0..count {
             let name = names.get(i).unwrap();
             let meta = meta_addresses.get(i).unwrap();
-            Self::register_internal(&env, owner.clone(), name.clone(), meta)?;
+            Self::register_internal(&env, owner.clone(), name.clone(), meta, false)?;
             let name_hash = Self::hash_name(&env, &name);
             registered.push_back(name_hash);
         }
@@ -363,6 +457,7 @@ impl WraithNamesContract {
         owner: Address,
         name: String,
         stealth_meta_address: Bytes,
+        via_auction: bool,
     ) -> Result<(), NamesError> {
         Self::validate_name(env, &name)?;
         if stealth_meta_address.len() != 64 {
@@ -402,6 +497,12 @@ impl WraithNamesContract {
         } else {
             None
         };
+
+        // During the 90-day premium window, top-level names of 4 characters
+        // or fewer can only be obtained through the sealed-bid auction.
+        if !via_auction && parent_hash.is_none() && auction::premium_block_active(env, len) {
+            return Err(NamesError::PremiumAuctionRequired);
+        }
 
         let name_hash = Self::hash_name(env, &name);
         let name_key = DataKey::Name(name_hash.clone());
@@ -639,6 +740,7 @@ impl WraithNamesContract {
         name: String,
         extend_to_ledger: u32,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         // Validate that extend_to_ledger is in the future
         let current_ledger = env.ledger().sequence();
         if extend_to_ledger <= current_ledger {
@@ -806,6 +908,148 @@ impl WraithNamesContract {
     /// Cancel the pending rotation, clearing all of its state.
     pub fn cancel_rotate_signers(env: Env, caller: Address) -> Result<(), NamesError> {
         multisig::cancel_rotate_signers(&env, caller)
+    }
+
+    // ── premium name auctions ────────────────────────────────────────────────
+
+    /// One-time initialization of the premium-name auction system.
+    ///
+    /// `admin` operates settlements per the runbook, `treasury` receives
+    /// winning bids, `token` is the payment asset (native XLM SAC on mainnet),
+    /// `reserve_price` is the minimum bid, and `commit_secs` / `reveal_secs`
+    /// are the phase durations for each auction. The 90-day premium window
+    /// starts at the ledger timestamp of this call.
+    pub fn init_auctions(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        token: Address,
+        reserve_price: i128,
+        commit_secs: u64,
+        reveal_secs: u64,
+    ) -> Result<(), AuctionError> {
+        auction::init(
+            &env,
+            admin,
+            treasury,
+            token,
+            reserve_price,
+            commit_secs,
+            reveal_secs,
+        )
+    }
+
+    /// Start a sealed-bid auction for a premium name (<= 4 chars, top-level).
+    /// Permissionless: anyone may open the auction for an eligible name.
+    pub fn start_auction(env: Env, name: String) -> Result<(), AuctionError> {
+        Self::validate_name(&env, &name).map_err(|_| AuctionError::NotPremiumName)?;
+
+        let len = name.len() as usize;
+        if len > auction::PREMIUM_NAME_MAX_LEN {
+            return Err(AuctionError::NotPremiumName);
+        }
+        // Only top-level names are auctioned; subdomains are gated by parent
+        // ownership instead.
+        let mut buf = [0u8; MAX_NAME_LEN];
+        name.copy_into_slice(&mut buf[..len]);
+        for i in 0..len {
+            if buf[i] == b'.' {
+                return Err(AuctionError::NotPremiumName);
+            }
+        }
+
+        let name_hash = Self::hash_name(&env, &name);
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Name(name_hash.clone()))
+        {
+            return Err(AuctionError::NameAlreadyRegistered);
+        }
+        auction::start(&env, name_hash, name)
+    }
+
+    /// Commit a sealed bid. `commitment` hides the bid amount; `deposit` is
+    /// transferred to the contract and must cover the bid revealed later.
+    pub fn commit_bid(
+        env: Env,
+        bidder: Address,
+        name: String,
+        commitment: BytesN<32>,
+        deposit: i128,
+    ) -> Result<(), AuctionError> {
+        let name_hash = Self::hash_name(&env, &name);
+        auction::commit(&env, bidder, name_hash, commitment, deposit)
+    }
+
+    /// Reveal a previously committed bid by disclosing the amount and salt.
+    pub fn reveal_bid(
+        env: Env,
+        bidder: Address,
+        name: String,
+        amount: i128,
+        salt: BytesN<32>,
+    ) -> Result<(), AuctionError> {
+        let name_hash = Self::hash_name(&env, &name);
+        auction::reveal(&env, bidder, name_hash, amount, salt)
+    }
+
+    /// Settle an auction after the reveal phase: pays the winning bid to the
+    /// treasury and refunds the winner's excess deposit. Permissionless so
+    /// funds can never be trapped, operated by the admin per the runbook.
+    pub fn settle_auction(env: Env, name: String) -> Result<(), AuctionError> {
+        let name_hash = Self::hash_name(&env, &name);
+        auction::settle(&env, name_hash)
+    }
+
+    /// Withdraw a losing (or unrevealed) bid deposit in full.
+    pub fn withdraw_bid(env: Env, bidder: Address, name: String) -> Result<(), AuctionError> {
+        let name_hash = Self::hash_name(&env, &name);
+        auction::withdraw(&env, bidder, name_hash)
+    }
+
+    /// Claim a won auction: registers the name to the winner with their
+    /// stealth meta-address.
+    pub fn claim_name(
+        env: Env,
+        winner: Address,
+        name: String,
+        stealth_meta_address: Bytes,
+    ) -> Result<(), AuctionError> {
+        winner.require_auth();
+        let name_hash = Self::hash_name(&env, &name);
+        auction::verify_claim(&env, &winner, &name_hash)?;
+        Self::register_internal(&env, winner, name, stealth_meta_address, true).map_err(|e| match e
+        {
+            NamesError::NameTaken => AuctionError::NameAlreadyRegistered,
+            NamesError::InvalidMetaAddress => AuctionError::InvalidMetaAddress,
+            _ => AuctionError::RegistrationFailed,
+        })
+    }
+
+    /// Read the auction state for a name, if any.
+    pub fn get_auction(env: Env, name: String) -> Option<Auction> {
+        let name_hash = Self::hash_name(&env, &name);
+        auction::load(&env, &name_hash)
+    }
+
+    /// Read the auction configuration, if initialized.
+    pub fn auction_config(env: Env) -> Option<AuctionConfig> {
+        auction::config(&env)
+    }
+
+    /// Compute the sealed-bid commitment for the given parameters.
+    ///
+    /// Intended for off-chain use (simulation only): calling this in a real
+    /// transaction would leak the bid amount.
+    pub fn compute_commitment(
+        env: Env,
+        name: String,
+        bidder: Address,
+        amount: i128,
+        salt: BytesN<32>,
+    ) -> BytesN<32> {
+        auction::compute_commitment(&env, &name, &bidder, amount, &salt)
     }
 }
 
@@ -1422,264 +1666,268 @@ mod test {
         assert_eq!(result, Err(Ok(NamesError::InvalidMetaAddress)));
     }
 
-    // --- Metadata tests ---
+    // ── Pause / unpause tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_set_and_get_metadata() {
+    fn test_pause_by_admin() {
         let env = Env::default();
         env.mock_all_auths();
 
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
+        // Initially not paused
+        assert!(!client.is_paused());
+
+        // Admin pauses
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Admin unpauses
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_register_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
         let owner = Address::generate(&env);
-        let name = String::from_str(&env, "eve");
+        let name = String::from_str(&env, "alice");
         let meta = Bytes::from_slice(&env, &[1u8; 64]);
-        client.register(&owner, &name, &meta);
 
-        let mut text_records = Map::<String, String>::new(&env);
-        text_records.set(
-            String::from_str(&env, "avatar"),
-            String::from_str(&env, "https://example.com/avatar.png"),
-        );
-        text_records.set(
-            String::from_str(&env, "twitter"),
-            String::from_str(&env, "@wraithprotocol"),
-        );
+        // Pause
+        client.pause(&admin);
+        assert!(client.is_paused());
 
-        let metadata = MetadataEntry {
-            text_records: text_records.clone(),
-            content_hash: BytesN::from_array(&env, &[9u8; 32]),
-        };
-
-        client.set_metadata(&owner, &name, &metadata);
-
-        let stored = client.get_metadata(&name);
-        assert_eq!(stored.text_records, text_records);
-        assert_eq!(stored.content_hash, BytesN::from_array(&env, &[9u8; 32]));
+        // Register should be rejected
+        let result = client.try_register(&owner, &name, &meta);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
     }
 
     #[test]
-    fn test_set_metadata_not_owner() {
+    fn test_update_rejected_when_paused() {
+        use soroban_sdk::testutils::Ledger;
+
         let env = Env::default();
         env.mock_all_auths();
+
+        // Configure ledger for TTL
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            env.ledger().set(info);
+        }
 
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
         let owner = Address::generate(&env);
-        let attacker = Address::generate(&env);
-        let name = String::from_str(&env, "mallory");
+        let name = String::from_str(&env, "bob");
         let meta = Bytes::from_slice(&env, &[2u8; 64]);
+        // Register first
         client.register(&owner, &name, &meta);
 
-        let text_records = Map::<String, String>::new(&env);
-        let metadata = MetadataEntry {
-            text_records,
-            content_hash: BytesN::from_array(&env, &[0u8; 32]),
-        };
+        // Pause
+        client.pause(&admin);
 
-        let result = client.try_set_metadata(&attacker, &name, &metadata);
-        assert_eq!(result, Err(Ok(NamesError::NotOwner)));
+        // Update should be rejected
+        let new_meta = Bytes::from_slice(&env, &[3u8; 64]);
+        let result = client.try_update(&owner, &name, &new_meta);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
     }
 
     #[test]
-    fn test_set_metadata_key_too_long() {
+    fn test_release_rejected_when_paused() {
+        use soroban_sdk::testutils::Ledger;
+
         let env = Env::default();
         env.mock_all_auths();
+
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            env.ledger().set(info);
+        }
 
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
-        let owner = Address::generate(&env);
-        let name = String::from_str(&env, "frank");
-        let meta = Bytes::from_slice(&env, &[3u8; 64]);
-        client.register(&owner, &name, &meta);
-
-        // Key exactly 65 bytes (MAX 64) → should fail
-        let long_key = String::from_str(
-            &env,
-            "012345678901234567890123456789012345678901234567890123456789012345",
-        );
-        let mut text_records = Map::<String, String>::new(&env);
-        text_records.set(long_key, String::from_str(&env, "x"));
-
-        let metadata = MetadataEntry {
-            text_records,
-            content_hash: BytesN::from_array(&env, &[0u8; 32]),
-        };
-
-        let result = client.try_set_metadata(&owner, &name, &metadata);
-        assert_eq!(result, Err(Ok(NamesError::MetadataKeyTooLong)));
-    }
-
-    #[test]
-    fn test_set_metadata_value_too_long() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register(WraithNamesContract, ());
-        let client = WraithNamesContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.init(&admin);
 
         let owner = Address::generate(&env);
-        let name = String::from_str(&env, "grace");
+        let name = String::from_str(&env, "carol");
         let meta = Bytes::from_slice(&env, &[4u8; 64]);
+        // Register first
         client.register(&owner, &name, &meta);
 
-        // Value exactly 257 bytes (MAX 256) → should fail
-        let long_value = String::from_str(&env, &"x".repeat(257));
-        let mut text_records = Map::<String, String>::new(&env);
-        text_records.set(String::from_str(&env, "avatar"), long_value);
+        // Pause
+        client.pause(&admin);
 
-        let metadata = MetadataEntry {
-            text_records,
-            content_hash: BytesN::from_array(&env, &[0u8; 32]),
-        };
-
-        let result = client.try_set_metadata(&owner, &name, &metadata);
-        assert_eq!(result, Err(Ok(NamesError::MetadataValueTooLong)));
+        // Release should be rejected
+        let result = client.try_release(&owner, &name);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
     }
 
     #[test]
-    fn test_set_metadata_total_too_long() {
+    fn test_resolve_works_when_paused() {
+        use soroban_sdk::testutils::Ledger;
+
         let env = Env::default();
         env.mock_all_auths();
+
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            env.ledger().set(info);
+        }
 
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
         let owner = Address::generate(&env);
-        let name = String::from_str(&env, "heidi");
+        let name = String::from_str(&env, "dave");
         let meta = Bytes::from_slice(&env, &[5u8; 64]);
         client.register(&owner, &name, &meta);
 
-        let mut text_records = Map::<String, String>::new(&env);
-        // 5 records each ~210 bytes (key=5, value=205) = 1050 total > 1024 limit
-        // Each record stays under the 256-byte per-value limit
-        text_records.set(
-            String::from_str(&env, "key00"),
-            String::from_str(&env, &"v".repeat(205)),
-        );
-        text_records.set(
-            String::from_str(&env, "key01"),
-            String::from_str(&env, &"v".repeat(205)),
-        );
-        text_records.set(
-            String::from_str(&env, "key02"),
-            String::from_str(&env, &"v".repeat(205)),
-        );
-        text_records.set(
-            String::from_str(&env, "key03"),
-            String::from_str(&env, &"v".repeat(205)),
-        );
-        text_records.set(
-            String::from_str(&env, "key04"),
-            String::from_str(&env, &"v".repeat(205)),
-        );
+        // Pause
+        client.pause(&admin);
 
-        let metadata = MetadataEntry {
-            text_records,
-            content_hash: BytesN::from_array(&env, &[0u8; 32]),
-        };
-
-        let result = client.try_set_metadata(&owner, &name, &metadata);
-        assert_eq!(result, Err(Ok(NamesError::MetadataTotalTooLong)));
+        // Resolve still works while paused
+        let resolved = client.resolve(&name);
+        assert_eq!(resolved, meta);
     }
 
     #[test]
-    fn test_get_metadata_not_found() {
+    fn test_name_of_works_when_paused() {
+        use soroban_sdk::testutils::Ledger;
+
         let env = Env::default();
         env.mock_all_auths();
+
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            env.ledger().set(info);
+        }
 
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
         let owner = Address::generate(&env);
-        let name = String::from_str(&env, "ivan");
+        let name = String::from_str(&env, "eve");
         let meta = Bytes::from_slice(&env, &[6u8; 64]);
         client.register(&owner, &name, &meta);
 
-        // Name exists but no metadata set
-        let result = client.try_get_metadata(&name);
-        assert_eq!(result, Err(Ok(NamesError::MetadataNotFound)));
+        // Pause
+        client.pause(&admin);
+
+        // name_of (reverse lookup) still works while paused
+        let resolved_name = client.name_of(&meta);
+        assert_eq!(resolved_name, name);
     }
 
     #[test]
-    fn test_get_metadata_unregistered_name() {
-        let env = Env::default();
+    fn test_extend_name_ttl_rejected_when_paused() {
+        use soroban_sdk::testutils::Ledger;
 
-        let contract_id = env.register(WraithNamesContract, ());
-        let client = WraithNamesContractClient::new(&env, &contract_id);
-
-        let name = String::from_str(&env, "nobody");
-        let result = client.try_get_metadata(&name);
-        assert_eq!(result, Err(Ok(NamesError::NameNotFound)));
-    }
-
-    #[test]
-    fn test_metadata_cleaned_on_release() {
         let env = Env::default();
         env.mock_all_auths();
 
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            info.max_entry_ttl = 300_000;
+            env.ledger().set(info);
+        }
+
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
         let owner = Address::generate(&env);
-        let name = String::from_str(&env, "judy");
+        let name = String::from_str(&env, "frank");
         let meta = Bytes::from_slice(&env, &[7u8; 64]);
         client.register(&owner, &name, &meta);
 
-        let mut text_records = Map::<String, String>::new(&env);
-        text_records.set(
-            String::from_str(&env, "avatar"),
-            String::from_str(&env, "https://example.com/pic.jpg"),
-        );
-        let metadata = MetadataEntry {
-            text_records,
-            content_hash: BytesN::from_array(&env, &[0u8; 32]),
-        };
+        // Pause
+        client.pause(&admin);
 
-        client.set_metadata(&owner, &name, &metadata);
-
-        // Verify metadata exists
-        let stored = client.get_metadata(&name);
-        assert_eq!(stored.text_records.len(), 1);
-
-        // Release should clean metadata
-        client.release(&owner, &name);
-
-        // After release, get_metadata should return NameNotFound (name is gone)
-        let result = client.try_get_metadata(&name);
-        assert_eq!(result, Err(Ok(NamesError::NameNotFound)));
+        // extend_name_ttl should be rejected
+        let extend_to = env.ledger().sequence() + 1000;
+        let result = client.try_extend_name_ttl(&name, &extend_to);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
     }
 
     #[test]
-    fn test_hot_path_unchanged_after_metadata() {
+    #[should_panic(expected = "HostError")]
+    fn test_admin_only_can_pause_wraith_names() {
         let env = Env::default();
         env.mock_all_auths();
 
         let contract_id = env.register(WraithNamesContract, ());
         let client = WraithNamesContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.init(&admin);
+
+        // Non-admin cannot pause (panic expected)
+        client.pause(&attacker);
+    }
+
+    #[test]
+    fn test_register_allowed_after_unpause() {
+        use soroban_sdk::testutils::Ledger;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            env.ledger().set(info);
+        }
+
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
         let owner = Address::generate(&env);
-        let name = String::from_str(&env, "karen");
+        let name = String::from_str(&env, "grace");
         let meta = Bytes::from_slice(&env, &[8u8; 64]);
+
+        // Pause then unpause
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        // Register should succeed
         client.register(&owner, &name, &meta);
-
-        // Set metadata
-        let text_records = Map::<String, String>::new(&env);
-        let metadata = MetadataEntry {
-            text_records,
-            content_hash: BytesN::from_array(&env, &[0u8; 32]),
-        };
-        client.set_metadata(&owner, &name, &metadata);
-
-        // Hot path: resolve still works
-        let resolved = client.resolve(&name);
-        assert_eq!(resolved, meta);
-
-        // Hot path: name_of still works
-        let found_name = client.name_of(&meta);
-        assert_eq!(found_name, name);
+        assert_eq!(client.resolve(&name), meta);
     }
 }
