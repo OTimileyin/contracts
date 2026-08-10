@@ -1,10 +1,13 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec,
-    IntoVal,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    IntoVal, Symbol, Vec,
 };
 use wraith_metrics::{contract_ids, dimension_names, emit_metric, metric_names};
+
+mod multisig;
+pub use multisig::RotationProposal;
 
 /// Storage keys.
 #[contracttype]
@@ -18,6 +21,16 @@ pub enum DataKey {
     FeeRecipient,
     /// Protocol fee in basis points (max 50 bps, 0 = disabled).
     FeeBasisPoints,
+    /// Pause admin address.
+    Admin,
+    /// Whether the contract is paused.
+    Paused,
+    /// Governance multisig signer set.
+    MultisigSigners,
+    /// Governance multisig quorum threshold.
+    MultisigThreshold,
+    /// Pending signer-rotation proposal, if any.
+    PendingRotation,
 }
 
 /// Errors that the sender contract can produce.
@@ -35,6 +48,40 @@ pub enum SenderError {
     TokenNotAllowed = 4,
     /// The fee configuration is invalid (e.g. fee > 50 bps, or fee > 0 with no recipient).
     InvalidFeeConfig = 5,
+    /// The contract is paused.
+    Paused = 16,
+    /// The batch withdrawal exceeds the supported size cap.
+    BatchTooLarge = 6,
+    /// The governance multisig has not been initialised.
+    MultisigNotInitialized = 7,
+    /// The governance multisig has already been initialised.
+    MultisigAlreadyInitialized = 8,
+    /// The caller is not a current governance signer.
+    NotSigner = 9,
+    /// The requested threshold is invalid (zero, or greater than signer count).
+    InvalidThreshold = 10,
+    /// A signer-rotation proposal is already pending.
+    RotationAlreadyPending = 11,
+    /// No signer-rotation proposal is pending.
+    NoPendingRotation = 12,
+    /// The caller has already approved the pending rotation.
+    AlreadyApprovedRotation = 13,
+    /// The pending rotation has not collected enough approvals yet.
+    QuorumNotMet = 14,
+    /// The rotation timelock has not elapsed yet.
+    TimelockNotElapsed = 15,
+}
+
+/// A single withdrawal entry for batched asset exits.
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalEntry {
+    /// The token contract to withdraw from or to transfer through.
+    pub token: Address,
+    /// The destination address for the withdrawal.
+    pub to: Address,
+    /// The amount to transfer in the token's base unit.
+    pub amount: i128,
 }
 
 /// Lightweight client wrapper that invokes the StealthAnnouncer contract via
@@ -80,8 +127,9 @@ mod asset_policy_client {
     }
 }
 
-const TTL_THRESHOLD: u32 = 17280;    // ~1 day
-const TTL_EXTEND_TO: u32 = 518400;   // ~30 days
+const TTL_THRESHOLD: u32 = 17280; // ~1 day
+const TTL_EXTEND_TO: u32 = 518400; // ~30 days
+const MAX_WITHDRAW_BATCH_SIZE: u32 = 30;
 
 #[contract]
 pub struct StealthSenderContract;
@@ -98,6 +146,7 @@ impl StealthSenderContract {
         asset_policy: Option<Address>,
         fee_recipient: Option<Address>,
         fee_basis_points: u32,
+        admin: Address,
     ) -> Result<(), SenderError> {
         if env.storage().instance().has(&DataKey::Announcer) {
             return Err(SenderError::AlreadyInitialized);
@@ -112,11 +161,10 @@ impl StealthSenderContract {
         env.storage()
             .instance()
             .set(&DataKey::Announcer, &announcer);
+        env.storage().instance().set(&DataKey::Admin, &admin);
 
         if let Some(ref policy) = asset_policy {
-            env.storage()
-                .instance()
-                .set(&DataKey::AssetPolicy, policy);
+            env.storage().instance().set(&DataKey::AssetPolicy, policy);
         }
 
         if let Some(ref recipient) = fee_recipient {
@@ -129,8 +177,67 @@ impl StealthSenderContract {
             .set(&DataKey::FeeBasisPoints, &fee_basis_points);
 
         // Extend instance TTL
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 
+        Ok(())
+    }
+
+    /// Pause the contract — admin only.
+    /// Prevents all sends and batch_sends while paused.
+    pub fn pause(env: Env, caller: Address) -> Result<(), SenderError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        if caller != admin {
+            panic!("unauthorized: only admin can pause");
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("paused"),), (caller,));
+        Ok(())
+    }
+
+    /// Unpause the contract — admin only.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), SenderError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        if caller != admin {
+            panic!("unauthorized: only admin can unpause");
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((soroban_sdk::symbol_short!("unpaused"),), (caller,));
+        Ok(())
+    }
+
+    /// Returns true if the contract is paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Require the contract is not paused. Call at the top of every
+    /// state-mutating entrypoint that should be disabled during an incident.
+    fn require_not_paused(env: &Env) -> Result<(), SenderError> {
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(SenderError::Paused);
+        }
         Ok(())
     }
 
@@ -154,6 +261,7 @@ impl StealthSenderContract {
         ephemeral_pub_key: BytesN<32>,
         metadata: Bytes,
     ) -> Result<(), SenderError> {
+        Self::require_not_paused(&env)?;
         sender.require_auth();
 
         let announcer: Address = env
@@ -163,7 +271,9 @@ impl StealthSenderContract {
             .ok_or(SenderError::NotInitialized)?;
 
         // Extend instance TTL
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Check asset policy if configured
         if let Some(policy_address) = env
@@ -183,10 +293,7 @@ impl StealthSenderContract {
             .get(&DataKey::FeeBasisPoints)
             .unwrap_or(0);
 
-        let fee_recipient: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRecipient);
+        let fee_recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
 
         let fee = if fee_basis_points > 0 && fee_recipient.is_some() {
             (amount * (fee_basis_points as i128)) / 10000
@@ -259,6 +366,7 @@ impl StealthSenderContract {
         metadatas: Vec<Bytes>,
         amounts: Vec<i128>,
     ) -> Result<(), SenderError> {
+        Self::require_not_paused(&env)?;
         sender.require_auth();
 
         let len = stealth_addresses.len();
@@ -273,7 +381,9 @@ impl StealthSenderContract {
             .ok_or(SenderError::NotInitialized)?;
 
         // Extend instance TTL
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Check asset policy if configured
         if let Some(policy_address) = env
@@ -293,10 +403,7 @@ impl StealthSenderContract {
             .get(&DataKey::FeeBasisPoints)
             .unwrap_or(0);
 
-        let fee_recipient: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRecipient);
+        let fee_recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
 
         let token_client = token::Client::new(&env, &token);
 
@@ -375,14 +482,111 @@ impl StealthSenderContract {
 
         Ok(())
     }
+
+    /// Withdraw assets to multiple destinations in a single atomic transaction.
+    ///
+    /// The batch is capped at 30 entries. If any single entry cannot be
+    /// processed, the entire batch aborts and no state changes are retained.
+    pub fn withdraw_many(
+        env: Env,
+        withdrawer: Address,
+        entries: Vec<WithdrawalEntry>,
+    ) -> Result<(), SenderError> {
+        withdrawer.require_auth();
+
+        let len = entries.len();
+        if len > MAX_WITHDRAW_BATCH_SIZE {
+            return Err(SenderError::BatchTooLarge);
+        }
+
+        let mut total_amount: i128 = 0;
+
+        for i in 0..len {
+            let entry = entries.get(i).unwrap();
+            let token_client = token::Client::new(&env, &entry.token);
+            total_amount += entry.amount;
+
+            token_client.transfer(&withdrawer, &entry.to, &entry.amount);
+
+            env.events().publish(
+                (Symbol::new(&env, "Withdrawn"),),
+                (
+                    withdrawer.clone(),
+                    entry.to.clone(),
+                    entry.amount,
+                    entry.token.clone(),
+                ),
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "BatchWithdrawn"),),
+            (withdrawer, len as u32, total_amount),
+        );
+
+        Ok(())
+    }
+
+    /// One-time setup of the governance signer set used to authorise signer
+    /// rotations. Independent of `init` — does not gate `send`/`batch_send`.
+    pub fn init_multisig(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), SenderError> {
+        multisig::init(&env, signers, threshold)
+    }
+
+    /// Current governance signer set.
+    pub fn signers(env: Env) -> Vec<Address> {
+        multisig::signers(&env)
+    }
+
+    /// Current governance quorum threshold.
+    pub fn threshold(env: Env) -> u32 {
+        multisig::threshold(&env)
+    }
+
+    /// The pending signer-rotation proposal, if any.
+    pub fn pending_rotation(env: Env) -> Option<RotationProposal> {
+        multisig::pending_rotation(&env)
+    }
+
+    /// Propose a new signer set + threshold behind the rotation timelock.
+    /// `caller` must be a current signer; the proposal is auto-approved by
+    /// `caller`. Rejects thresholds that could never reach quorum.
+    pub fn propose_rotate_signers(
+        env: Env,
+        caller: Address,
+        new_signers: Vec<Address>,
+        new_threshold: u32,
+    ) -> Result<(), SenderError> {
+        multisig::propose_rotate_signers(&env, caller, new_signers, new_threshold)
+    }
+
+    /// Approve the pending signer-rotation proposal.
+    pub fn approve_rotate_signers(env: Env, caller: Address) -> Result<(), SenderError> {
+        multisig::approve_rotate_signers(&env, caller)
+    }
+
+    /// Execute the pending rotation once quorum is met and the timelock has
+    /// elapsed. Emits `SignersRotated`.
+    pub fn execute_rotate_signers(env: Env, caller: Address) -> Result<(), SenderError> {
+        multisig::execute_rotate_signers(&env, caller)
+    }
+
+    /// Cancel the pending rotation, clearing all of its state.
+    pub fn cancel_rotate_signers(env: Env, caller: Address) -> Result<(), SenderError> {
+        multisig::cancel_rotate_signers(&env, caller)
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::testutils::storage::Instance;
-    use soroban_sdk::{Env, Bytes, BytesN};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{Bytes, BytesN, Env};
 
     #[contract]
     pub struct MockAnnouncer;
@@ -397,7 +601,11 @@ mod test {
             metadata: Bytes,
         ) {
             env.events().publish(
-                (soroban_sdk::symbol_short!("announce"), scheme_id, stealth_address),
+                (
+                    soroban_sdk::symbol_short!("announce"),
+                    scheme_id,
+                    stealth_address,
+                ),
                 (env.current_contract_address(), ephemeral_pub_key, metadata),
             );
         }
@@ -422,30 +630,34 @@ mod test {
 
         // 3. Register standard asset token contract
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let token_client = token::Client::new(&env, &token_id);
 
+        let admin = Address::generate(&env);
+
         // 4. Initialize StealthSender
-        client.init(&announcer_id, &None, &None, &0);
+        client.init(&announcer_id, &None, &None, &0, &admin);
 
         // Verify AlreadyInitialized error
-        let init_res = client.try_init(&announcer_id, &None, &None, &0);
+        let init_res = client.try_init(&announcer_id, &None, &None, &0, &admin);
         assert_eq!(init_res, Err(Ok(SenderError::AlreadyInitialized)));
 
         // Setup transfer accounts and mint tokens
         let sender = Address::generate(&env);
         let stealth_address = Address::generate(&env);
-        
+
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
         token_admin_client.mint(&sender, &1000);
-        
+
         assert_eq!(token_client.balance(&sender), 1000);
         assert_eq!(token_client.balance(&stealth_address), 0);
 
         // 5. Test send functionality
         let epk = BytesN::from_array(&env, &[1u8; 32]);
         let meta = Bytes::from_slice(&env, &[0u8; 1]);
-        
+
         client.send(&sender, &token_id, &500, &1, &stealth_address, &epk, &meta);
 
         // Check balances
@@ -453,9 +665,7 @@ mod test {
         assert_eq!(token_client.balance(&stealth_address), 500);
 
         // 6. Test TTL extension behavior
-        let initial_ttl = env.as_contract(&sender_id, || {
-            env.storage().instance().get_ttl()
-        });
+        let initial_ttl = env.as_contract(&sender_id, || env.storage().instance().get_ttl());
         assert!(initial_ttl > 0);
 
         // Fast-forward sequence number to reduce TTL below the 17,280 threshold
@@ -463,19 +673,23 @@ mod test {
             li.sequence_number += 590000;
         });
 
-        let reduced_ttl = env.as_contract(&sender_id, || {
-            env.storage().instance().get_ttl()
-        });
+        let reduced_ttl = env.as_contract(&sender_id, || env.storage().instance().get_ttl());
         assert!(reduced_ttl < initial_ttl);
 
         // Invoke send again to trigger TTL extension
         let stealth_address_2 = Address::generate(&env);
-        client.send(&sender, &token_id, &100, &1, &stealth_address_2, &epk, &meta);
+        client.send(
+            &sender,
+            &token_id,
+            &100,
+            &1,
+            &stealth_address_2,
+            &epk,
+            &meta,
+        );
 
         // Verify TTL is bumped back to max/extend_to value
-        let bumped_ttl = env.as_contract(&sender_id, || {
-            env.storage().instance().get_ttl()
-        });
+        let bumped_ttl = env.as_contract(&sender_id, || env.storage().instance().get_ttl());
         assert!(bumped_ttl > reduced_ttl);
         assert_eq!(bumped_ttl, 518400); // Should be bumped to TTL_EXTEND_TO
     }
@@ -489,11 +703,15 @@ mod test {
         let sender_id = env.register(StealthSenderContract, ());
         let client = StealthSenderContractClient::new(&env, &sender_id);
 
+        let admin = Address::generate(&env);
+
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let token_client = token::Client::new(&env, &token_id);
-        
-        client.init(&announcer_id, &None, &None, &0);
+
+        client.init(&announcer_id, &None, &None, &0, &admin);
 
         let sender = Address::generate(&env);
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
@@ -513,10 +731,376 @@ mod test {
         let metadatas = soroban_sdk::vec![&env, meta_1, meta_2];
         let amounts = soroban_sdk::vec![&env, 700, 800];
 
-        client.batch_send(&sender, &token_id, &1, &addresses, &epks, &metadatas, &amounts);
+        client.batch_send(
+            &sender, &token_id, &1, &addresses, &epks, &metadatas, &amounts,
+        );
 
         assert_eq!(token_client.balance(&sender), 500);
         assert_eq!(token_client.balance(&stealth_addr_1), 700);
         assert_eq!(token_client.balance(&stealth_addr_2), 800);
+    }
+
+    // ── Pause / unpause tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_pause_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let announcer_id = env.register(MockAnnouncer, ());
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let admin = Address::generate(&env);
+        client.init(&announcer_id, &None, &None, &0, &admin);
+
+        // Initially not paused
+        assert!(!client.is_paused());
+
+        // Admin pauses
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Admin unpauses
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_send_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Configure test ledger to have large min_persistent_entry_ttl
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = 600000;
+        });
+
+        let announcer_id = env.register(MockAnnouncer, ());
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let admin = Address::generate(&env);
+        client.init(&announcer_id, &None, &None, &0, &admin);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+
+        let sender = Address::generate(&env);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &1000);
+
+        let stealth_address = Address::generate(&env);
+        let epk = BytesN::from_array(&env, &[1u8; 32]);
+        let meta = Bytes::from_slice(&env, &[0u8; 1]);
+
+        // Pause the contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Send should be rejected
+        let result = client.try_send(&sender, &token_id, &500, &1, &stealth_address, &epk, &meta);
+        assert_eq!(result, Err(Ok(SenderError::Paused)));
+
+        // Balances unchanged
+        assert_eq!(token_client.balance(&sender), 1000);
+        assert_eq!(token_client.balance(&stealth_address), 0);
+    }
+
+    #[test]
+    fn test_batch_send_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let announcer_id = env.register(MockAnnouncer, ());
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let admin = Address::generate(&env);
+        client.init(&announcer_id, &None, &None, &0, &admin);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+
+        let sender = Address::generate(&env);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &2000);
+
+        let stealth_addr_1 = Address::generate(&env);
+        let stealth_addr_2 = Address::generate(&env);
+        let epk_1 = BytesN::from_array(&env, &[1u8; 32]);
+        let epk_2 = BytesN::from_array(&env, &[2u8; 32]);
+        let meta_1 = Bytes::from_slice(&env, &[10u8; 1]);
+        let meta_2 = Bytes::from_slice(&env, &[20u8; 1]);
+        let addresses = soroban_sdk::vec![&env, stealth_addr_1.clone(), stealth_addr_2.clone()];
+        let epks = soroban_sdk::vec![&env, epk_1, epk_2];
+        let metadatas = soroban_sdk::vec![&env, meta_1, meta_2];
+        let amounts = soroban_sdk::vec![&env, 700, 800];
+
+        // Pause
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        let result = client.try_batch_send(
+            &sender, &token_id, &1, &addresses, &epks, &metadatas, &amounts,
+        );
+        assert_eq!(result, Err(Ok(SenderError::Paused)));
+
+        // Balances unchanged
+        assert_eq!(token_client.balance(&sender), 2000);
+        assert_eq!(token_client.balance(&stealth_addr_1), 0);
+        assert_eq!(token_client.balance(&stealth_addr_2), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn test_admin_only_can_pause() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let announcer_id = env.register(MockAnnouncer, ());
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.init(&announcer_id, &None, &None, &0, &admin);
+
+        // Non-admin cannot pause (panic expected)
+        client.pause(&attacker);
+    }
+
+    #[test]
+    fn test_send_allowed_after_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = 600000;
+        });
+
+        let announcer_id = env.register(MockAnnouncer, ());
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let admin = Address::generate(&env);
+        client.init(&announcer_id, &None, &None, &0, &admin);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+
+        let sender = Address::generate(&env);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &1000);
+
+        let stealth_address = Address::generate(&env);
+        let epk = BytesN::from_array(&env, &[1u8; 32]);
+        let meta = Bytes::from_slice(&env, &[0u8; 1]);
+
+        // Pause then unpause
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        // Send should succeed
+        client.send(&sender, &token_id, &500, &1, &stealth_address, &epk, &meta);
+        assert_eq!(token_client.balance(&sender), 500);
+        assert_eq!(token_client.balance(&stealth_address), 500);
+    }
+
+    #[test]
+    fn test_withdraw_allowed_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = 600000;
+        });
+
+        let announcer_id = env.register(MockAnnouncer, ());
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let admin = Address::generate(&env);
+        client.init(&announcer_id, &None, &None, &0, &admin);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+
+        let withdrawer = Address::generate(&env);
+        let to = Address::generate(&env);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&withdrawer, &1000);
+
+        let mut entries = Vec::new(&env);
+        entries.push_back(WithdrawalEntry {
+            token: token_id.clone(),
+            to: to.clone(),
+            amount: 600,
+        });
+
+        // Pause the contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Withdrawals remain available while paused so users can always exit.
+        client.withdraw_many(&withdrawer, &entries);
+        assert_eq!(token_client.balance(&withdrawer), 400);
+        assert_eq!(token_client.balance(&to), 600);
+    }
+
+    fn setup_multisig(env: &Env) -> (StealthSenderContractClient, Vec<Address>) {
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(env, &sender_id);
+
+        let signers = soroban_sdk::vec![
+            env,
+            Address::generate(env),
+            Address::generate(env),
+            Address::generate(env),
+            Address::generate(env),
+            Address::generate(env),
+        ];
+        client.init_multisig(&signers, &3);
+
+        (client, signers)
+    }
+
+    #[test]
+    fn test_init_multisig_rejects_invalid_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let sender_id = env.register(StealthSenderContract, ());
+        let client = StealthSenderContractClient::new(&env, &sender_id);
+
+        let signers = soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env)];
+
+        // Zero threshold is unreachable.
+        let res = client.try_init_multisig(&signers, &0);
+        assert_eq!(res, Err(Ok(SenderError::InvalidThreshold)));
+
+        // Threshold greater than signer count is unreachable.
+        let res = client.try_init_multisig(&signers, &3);
+        assert_eq!(res, Err(Ok(SenderError::InvalidThreshold)));
+    }
+
+    #[test]
+    fn test_propose_rotate_signers_rejects_invalid_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, signers) = setup_multisig(&env);
+        let new_signers = soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env)];
+
+        let res = client.try_propose_rotate_signers(&signers.get(0).unwrap(), &new_signers, &0);
+        assert_eq!(res, Err(Ok(SenderError::InvalidThreshold)));
+
+        let res = client.try_propose_rotate_signers(&signers.get(0).unwrap(), &new_signers, &3);
+        assert_eq!(res, Err(Ok(SenderError::InvalidThreshold)));
+
+        // No proposal was recorded by the rejected attempts.
+        assert!(client.pending_rotation().is_none());
+    }
+
+    #[test]
+    fn test_rotate_signers_requires_quorum_and_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, signers) = setup_multisig(&env);
+
+        let new_signers = soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env)];
+
+        client.propose_rotate_signers(&signers.get(0).unwrap(), &new_signers, &2);
+
+        // Only one rotation may be pending at a time.
+        let res = client.try_propose_rotate_signers(&signers.get(1).unwrap(), &new_signers, &2);
+        assert_eq!(res, Err(Ok(SenderError::RotationAlreadyPending)));
+
+        // Only 1 of 3 required approvals so far (the proposer's).
+        let res = client.try_execute_rotate_signers(&signers.get(0).unwrap());
+        assert_eq!(res, Err(Ok(SenderError::QuorumNotMet)));
+
+        client.approve_rotate_signers(&signers.get(1).unwrap());
+        client.approve_rotate_signers(&signers.get(2).unwrap());
+
+        // Quorum met, but the timelock has not elapsed yet.
+        let res = client.try_execute_rotate_signers(&signers.get(0).unwrap());
+        assert_eq!(res, Err(Ok(SenderError::TimelockNotElapsed)));
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += multisig::ROTATION_TIMELOCK_SECS;
+        });
+
+        client.execute_rotate_signers(&signers.get(0).unwrap());
+
+        assert_eq!(client.signers(), new_signers);
+        assert_eq!(client.threshold(), 2);
+        assert!(client.pending_rotation().is_none());
+    }
+
+    #[test]
+    fn test_cancelled_rotation_clears_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, signers) = setup_multisig(&env);
+
+        let new_signers = soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env)];
+        client.propose_rotate_signers(&signers.get(0).unwrap(), &new_signers, &2);
+        client.approve_rotate_signers(&signers.get(1).unwrap());
+
+        client.cancel_rotate_signers(&signers.get(2).unwrap());
+
+        // Cancelling clears the proposal entirely.
+        assert!(client.pending_rotation().is_none());
+
+        // The original signer set / threshold are untouched by the aborted rotation.
+        assert_eq!(client.signers(), signers);
+        assert_eq!(client.threshold(), 3);
+
+        // A stale approve/execute/cancel against the cleared proposal fails cleanly.
+        let res = client.try_approve_rotate_signers(&signers.get(3).unwrap());
+        assert_eq!(res, Err(Ok(SenderError::NoPendingRotation)));
+        let res = client.try_execute_rotate_signers(&signers.get(0).unwrap());
+        assert_eq!(res, Err(Ok(SenderError::NoPendingRotation)));
+        let res = client.try_cancel_rotate_signers(&signers.get(0).unwrap());
+        assert_eq!(res, Err(Ok(SenderError::NoPendingRotation)));
+
+        // A fresh proposal can be made immediately — no leftover state blocks it.
+        let other_signers =
+            soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env)];
+        client.propose_rotate_signers(&signers.get(0).unwrap(), &other_signers, &2);
+        assert!(client.pending_rotation().is_some());
+    }
+
+    #[test]
+    fn test_non_signer_cannot_propose_or_approve() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, signers) = setup_multisig(&env);
+        let outsider = Address::generate(&env);
+
+        let new_signers = soroban_sdk::vec![&env, Address::generate(&env), Address::generate(&env)];
+        let res = client.try_propose_rotate_signers(&outsider, &new_signers, &2);
+        assert_eq!(res, Err(Ok(SenderError::NotSigner)));
+
+        client.propose_rotate_signers(&signers.get(0).unwrap(), &new_signers, &2);
+        let res = client.try_approve_rotate_signers(&outsider);
+        assert_eq!(res, Err(Ok(SenderError::NotSigner)));
     }
 }
