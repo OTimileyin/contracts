@@ -1,7 +1,7 @@
 {
-  "generated_at": "1785999668",
-  "commit": "baseline",
-  "threshold_pct": 5.0,
+  "generated_at": "1786344334",
+  "commit": "87aba01505870d033b2b56c5b853e771a2978682",
+  "threshold_pct": 5,
   "results": [
     {
       "contract": "stealth-announcer",
