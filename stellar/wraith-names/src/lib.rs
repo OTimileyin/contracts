@@ -343,6 +343,7 @@ impl WraithNamesContract {
         names: Vec<String>,
         meta_addresses: Vec<Bytes>,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         owner.require_auth();
 
         let count = names.len();
@@ -391,6 +392,7 @@ impl WraithNamesContract {
         names: Vec<String>,
         extend_to_ledger: u32,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         let count = names.len();
         if count > BULK_LIMIT {
             return Err(NamesError::BulkLimitExceeded);
@@ -749,6 +751,7 @@ impl WraithNamesContract {
         name: String,
         metadata: MetadataEntry,
     ) -> Result<(), NamesError> {
+        Self::require_not_paused(&env)?;
         owner.require_auth();
 
         let name_hash = Self::hash_name(&env, &name);
@@ -1086,6 +1089,7 @@ impl WraithNamesContract {
         name: String,
         stealth_meta_address: Bytes,
     ) -> Result<(), AuctionError> {
+        Self::require_not_paused(&env).map_err(|_| AuctionError::Paused)?;
         winner.require_auth();
         let name_hash = Self::hash_name(&env, &name);
         auction::verify_claim(&env, &winner, &name_hash)?;
@@ -1952,6 +1956,44 @@ mod test {
     }
 
     #[test]
+    fn test_set_metadata_rejected_when_paused() {
+        use soroban_sdk::testutils::Ledger;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        {
+            let mut info = env.ledger().get();
+            info.min_persistent_entry_ttl = 200_000;
+            env.ledger().set(info);
+        }
+
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
+        let owner = Address::generate(&env);
+        let name = String::from_str(&env, "david");
+        let meta = Bytes::from_slice(&env, &[9u8; 64]);
+        client.register(&owner, &name, &meta);
+
+        let text_records = Map::<String, String>::new(&env);
+        let metadata = MetadataEntry {
+            text_records,
+            content_hash: BytesN::from_array(&env, &[1u8; 32]),
+        };
+
+        // Pause
+        client.pause(&admin);
+
+        // set_metadata should be rejected
+        let result = client.try_set_metadata(&owner, &name, &metadata);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
+    }
+
+    #[test]
     #[should_panic(expected = "HostError")]
     fn test_admin_only_can_pause_wraith_names() {
         let env = Env::default();
@@ -2001,6 +2043,74 @@ mod test {
         assert_eq!(client.resolve(&name), meta);
     }
     // --- Metadata tests ---
+
+    #[test]
+    fn test_bulk_register_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
+        let owner = Address::generate(&env);
+        let names = soroban_sdk::vec![&env, String::from_str(&env, "alice")];
+        let metas = soroban_sdk::vec![&env, Bytes::from_slice(&env, &[1u8; 64])];
+
+        // Pause
+        client.pause(&admin);
+
+        // bulk_register should be rejected
+        let result = client.try_bulk_register(&owner, &names, &metas);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
+    }
+
+    #[test]
+    fn test_bulk_renew_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
+        let names = soroban_sdk::vec![&env, String::from_str(&env, "alpha")];
+        let extend_to = env.ledger().sequence() + 10000;
+
+        // Pause
+        client.pause(&admin);
+
+        // bulk_renew should be rejected
+        let result = client.try_bulk_renew(&names, &extend_to);
+        assert_eq!(result, Err(Ok(NamesError::Paused)));
+    }
+
+    #[test]
+    fn test_claim_name_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(WraithNamesContract, ());
+        let client = WraithNamesContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
+        let winner = Address::generate(&env);
+        let name = String::from_str(&env, "alice");
+        let meta = Bytes::from_slice(&env, &[1u8; 64]);
+
+        // Pause
+        client.pause(&admin);
+
+        // claim_name should be rejected (pause check fires before auction verification)
+        let result = client.try_claim_name(&winner, &name, &meta);
+        assert_eq!(result, Err(Ok(AuctionError::Paused)));
+    }
 
     #[test]
     fn test_set_and_get_metadata() {

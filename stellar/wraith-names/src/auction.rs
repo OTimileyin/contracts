@@ -128,6 +128,8 @@ pub enum AuctionError {
     WinnerCannotWithdraw = 121,
     InvalidMetaAddress = 122,
     RegistrationFailed = 123,
+    /// The contract is paused.
+    Paused = 124,
 }
 
 /// One-time initialization. `launch_time` is the current ledger timestamp.
